@@ -6,8 +6,12 @@ import { Rng } from './rng.js';
 // Helpers
 // ----------------------------------------------------------------
 
-function clamp(v: number, lo: number, hi: number): number {
+export function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
+}
+
+export function clampChannel(v: number): number {
+  return clamp(v, 0, 255);
 }
 
 /** Ellipse alpha profile shared by stamp and batch. */

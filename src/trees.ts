@@ -1,5 +1,7 @@
 import {
   batchStampEllipses,
+  clamp,
+  clampChannel,
   darkenRim,
   drawLine,
   fillTriangle,
@@ -61,9 +63,6 @@ const DEAD_BASES: Color[] = [
 
 const MOSS_RGBA: RGBA = [50, 70, 40, 180];
 
-function clamp(v: number, lo = 0, hi = 255): number {
-  return v < lo ? lo : v > hi ? hi : v;
-}
 
 function pick<T>(rng: Rng, items: readonly T[]): T {
   return items[rng.nextInt(0, items.length - 1)];
@@ -85,9 +84,9 @@ function jitterColor(
 
 function shiftColor(base: Color, dr: number, dg: number, db: number): Color {
   return [
-    clamp(base[0] + dr, 0, 255),
-    clamp(base[1] + dg, 0, 255),
-    clamp(base[2] + db, 0, 255),
+    clampChannel(base[0] + dr),
+    clampChannel(base[1] + dg),
+    clampChannel(base[2] + db),
   ];
 }
 
@@ -97,9 +96,9 @@ function asRgba(color: Color, alpha: number): RGBA {
 
 function lightenRgba(rgba: RGBA, amount: number): RGBA {
   return [
-    clamp(rgba[0] + amount, 0, 255),
-    clamp(rgba[1] + amount, 0, 255),
-    clamp(rgba[2] + amount, 0, 255),
+    clampChannel(rgba[0] + amount),
+    clampChannel(rgba[1] + amount),
+    clampChannel(rgba[2] + amount),
     rgba[3],
   ];
 }
