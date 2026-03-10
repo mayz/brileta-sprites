@@ -1,16 +1,240 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>brileta-sprites demo</title>
-  <style>
-    body { margin: 20px; background: #1a1a2e; color: #eee; font-family: monospace; }
-    canvas { image-rendering: pixelated; border: 1px solid #444; }
-  </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>brileta-sprites</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #1a1a2e;
+    color: #e0e0e0;
+    font-family: system-ui, -apple-system, sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 2rem 1rem;
+    min-height: 100vh;
+  }
+  h1 {
+    font-size: 1.6rem;
+    font-weight: 600;
+    color: #fff;
+    margin-bottom: 0.3rem;
+  }
+  .subtitle {
+    color: #8888aa;
+    font-size: 0.9rem;
+    margin-bottom: 1.5rem;
+  }
+  .controls {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    margin-bottom: 2rem;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+  .controls label {
+    color: #8888aa;
+    font-size: 0.8rem;
+  }
+  input[type="text"] {
+    background: #16213e;
+    border: 1px solid #334;
+    color: #fff;
+    padding: 0.4rem 0.6rem;
+    border-radius: 4px;
+    font-size: 0.9rem;
+    width: 10rem;
+    font-family: monospace;
+  }
+  input[type="text"]:focus {
+    outline: none;
+    border-color: #557;
+  }
+  button {
+    background: #16213e;
+    border: 1px solid #334;
+    color: #ccc;
+    padding: 0.4rem 0.8rem;
+    border-radius: 4px;
+    font-size: 0.85rem;
+    cursor: pointer;
+  }
+  button:hover { background: #1a2744; border-color: #557; color: #fff; }
+  button:active { background: #223355; }
+  input[type="range"] {
+    width: 6rem;
+    accent-color: #557;
+  }
+  .zoom-label {
+    font-size: 0.8rem;
+    color: #8888aa;
+    min-width: 2rem;
+  }
+  .section { margin-bottom: 2rem; width: 100%; max-width: 900px; }
+  .section h2 {
+    font-size: 1rem;
+    font-weight: 500;
+    color: #aaa;
+    margin-bottom: 0.8rem;
+    padding-bottom: 0.3rem;
+    border-bottom: 1px solid #2a2a44;
+  }
+  .grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+  }
+  .sprite {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.15rem;
+  }
+  .sprite canvas {
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+  }
+  .sprite .label {
+    font-size: 0.6rem;
+    color: #666;
+  }
+</style>
 </head>
 <body>
-  <h1>brileta-sprites demo</h1>
-  <p>Demo script will be added here.</p>
+
+<h1>brileta-sprites</h1>
+<p class="subtitle">Procedural tree and boulder sprite generation.</p>
+
+<div class="controls">
+  <label for="seed">Seed</label>
+  <input type="text" id="seed" value="0">
+  <button id="generate">Generate</button>
+  <button id="random">Random Seed</button>
+  <label for="zoom">Zoom</label>
+  <input type="range" id="zoom" min="1" max="8" value="4">
+  <span class="zoom-label" id="zoom-label">4x</span>
+</div>
+
+<div class="section">
+  <h2>Trees</h2>
+  <div class="grid" id="trees"></div>
+</div>
+
+<div class="section">
+  <h2>Boulders</h2>
+  <div class="grid" id="boulders"></div>
+</div>
+
+<script type="module">
+import { Rng } from '../dist/rng.js';
+import { generateTree } from '../dist/trees.js';
+import { generateBoulder } from '../dist/boulders.js';
+
+const SPRITE_TYPES = [
+  { salt: 0, count: 30, gen: generateTree,    grid: document.getElementById('trees') },
+  { salt: 1, count: 20, gen: generateBoulder, grid: document.getElementById('boulders') },
+];
+
+const seedInput = document.getElementById('seed');
+const zoomSlider = document.getElementById('zoom');
+const zoomLabel = document.getElementById('zoom-label');
+
+function randomSeed() {
+  return String((Math.random() * 0xFFFFFFFF) >>> 0);
+}
+
+// Cache an OffscreenCanvas per sprite at generation time so zoom
+// changes only do a single drawImage blit per sprite.
+function bakeOffscreen(sprite) {
+  const { width: w, height: h, data } = sprite.canvas;
+  const imgData = new ImageData(new Uint8ClampedArray(data), w, h);
+  const oc = new OffscreenCanvas(w, h);
+  oc.getContext('2d').putImageData(imgData, 0, 0);
+  sprite._oc = oc;
+}
+
+function blitToCanvas(sprite, canvasEl, zoom) {
+  const w = sprite.canvas.width;
+  const h = sprite.canvas.height;
+  canvasEl.width = w * zoom;
+  canvasEl.height = h * zoom;
+  const ctx = canvasEl.getContext('2d');
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(sprite._oc, 0, 0, w * zoom, h * zoom);
+}
+
+// Reuse existing DOM nodes on zoom changes instead of tearing down
+// and rebuilding the entire grid each time.
+function renderGrid(container, sprites, zoom) {
+  while (container.children.length > sprites.length)
+    container.lastChild.remove();
+  for (let i = 0; i < sprites.length; i++) {
+    let wrapper = container.children[i];
+    if (!wrapper) {
+      wrapper = document.createElement('div');
+      wrapper.className = 'sprite';
+      wrapper.appendChild(document.createElement('canvas'));
+      const label = document.createElement('span');
+      label.className = 'label';
+      wrapper.appendChild(label);
+      container.appendChild(wrapper);
+    }
+    blitToCanvas(sprites[i], wrapper.querySelector('canvas'), zoom);
+    wrapper.querySelector('.label').textContent = sprites[i].archetype;
+  }
+}
+
+let spriteData = [];
+
+function generate() {
+  const inputSeed = (parseInt(seedInput.value, 10) || 0) >>> 0;
+  seedInput.value = String(inputSeed);
+
+  spriteData = SPRITE_TYPES.map(({ salt, count, gen }) => {
+    const sprites = [];
+    for (let i = 0; i < count; i++) {
+      const seed = Rng.deriveSpatialSeed(i, 0, inputSeed, salt);
+      const sprite = gen(seed);
+      bakeOffscreen(sprite);
+      sprites.push(sprite);
+    }
+    return sprites;
+  });
+
+  render();
+}
+
+function render() {
+  const zoom = parseInt(zoomSlider.value, 10);
+  SPRITE_TYPES.forEach(({ grid }, i) => renderGrid(grid, spriteData[i], zoom));
+}
+
+document.getElementById('generate').addEventListener('click', generate);
+
+document.getElementById('random').addEventListener('click', () => {
+  seedInput.value = randomSeed();
+  generate();
+});
+
+seedInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') generate();
+});
+
+let renderPending = false;
+zoomSlider.addEventListener('input', () => {
+  zoomLabel.textContent = zoomSlider.value + 'x';
+  if (!renderPending) {
+    renderPending = true;
+    requestAnimationFrame(() => { renderPending = false; render(); });
+  }
+});
+
+seedInput.value = randomSeed();
+generate();
+</script>
+
 </body>
 </html>
