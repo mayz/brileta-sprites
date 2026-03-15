@@ -660,8 +660,8 @@ function generateSapling(canvas: Canvas, size: number, rng: Rng): void {
   finishTree(canvas, rng, canopyCx, canopyCy, baseRadius * 1.9);
 }
 
-export function generateTree(seed: number, size = 20): TreeResult {
-  const archetype = archetypeFromSeed(seed);
+export function generateTree(seed: number, size = 20, archetype?: TreeArchetype): TreeResult {
+  archetype = archetype ?? archetypeFromSeed(seed);
   const rng = new Rng(seed);
   const canvasSize = resolveCanvasSize(rng, archetype, size);
   const canvas = new Canvas(canvasSize, canvasSize);

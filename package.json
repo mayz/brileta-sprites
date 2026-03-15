@@ -2,8 +2,15 @@
   "name": "brileta-sprites",
   "version": "0.1.0",
   "type": "module",
+  "exports": {
+    "./trees": "./dist/trees.js",
+    "./rng": "./dist/rng.js",
+    "./boulders": "./dist/boulders.js",
+    "./types": "./dist/types.js"
+  },
   "scripts": {
     "build": "tsc",
+    "prepare": "npm run build",
     "dev": "npx serve . -p 8080"
   },
   "devDependencies": {
