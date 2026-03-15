@@ -116,8 +116,7 @@
 <div class="controls">
   <label for="seed">Seed</label>
   <input type="text" id="seed" value="0">
-  <button id="generate">Generate</button>
-  <button id="random">Random Seed</button>
+  <button id="random">Randomize</button>
   <label for="zoom">Zoom</label>
   <input type="range" id="zoom" min="1" max="8" value="4">
   <span class="zoom-label" id="zoom-label">4x</span>
@@ -222,8 +221,6 @@ function render() {
   SPRITE_TYPES.forEach(({ grid }, i) => renderGrid(grid, spriteData[i], zoom));
 }
 
-document.getElementById('generate').addEventListener('click', generate);
-
 document.getElementById('random').addEventListener('click', () => {
   seedInput.value = randomSeed();
   generate();
@@ -232,6 +229,8 @@ document.getElementById('random').addEventListener('click', () => {
 seedInput.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') generate();
 });
+
+seedInput.addEventListener('blur', generate);
 
 let renderPending = false;
 zoomSlider.addEventListener('input', () => {
