@@ -464,22 +464,24 @@ function generateConifer(canvas: Canvas, size: number, rng: Rng): void {
   const lean = rng.nextRange(-1.5, 1.5);
   const cx = size / 2 + lean * 0.3;
   const trunkBottom = size - 1;
-  drawTaperedTrunk(
-    canvas,
-    cx,
-    trunkBottom,
-    1,
-    Math.max(1.5, size * 0.1),
-    1,
-    trunk,
-    rng.nextInt(1, 2),
-  );
 
+  // Pre-compute canopy tier geometry so we know where the top of the canopy
+  // lands before drawing the trunk (prevents trunk poking above canopy).
   const tierCount = rng.nextInt(3, 6);
   const maxWidth = size * rng.nextRange(0.35, 0.55);
   const tierHeightBase = size * 0.35;
-  let currentBottom = trunkBottom - Math.round(size * 0.2);
+  const canopyBaseY = trunkBottom - Math.round(size * 0.2);
+  let currentBottom = canopyBaseY;
   let topMost = currentBottom;
+
+  interface TierInfo {
+    cx: number;
+    top: number;
+    bottom: number;
+    halfWidth: number;
+    color: RGBA;
+  }
+  const tiers: TierInfo[] = [];
 
   for (let i = 0; i < tierCount; i++) {
     const t = tierCount === 1 ? 0 : i / (tierCount - 1);
@@ -490,25 +492,50 @@ function generateConifer(canvas: Canvas, size: number, rng: Rng): void {
     const tierColor = asRgba(shiftColor(canopyBase, shade, shade, shade), 240);
     const tierTop = currentBottom - tierHeight;
 
-    fillTriangle(
-      canvas,
-      tierCx,
-      tierTop,
-      tierCx - tierWidth * 0.5,
-      currentBottom,
-      tierCx + tierWidth * 0.5,
-      currentBottom,
-      tierColor[0],
-      tierColor[1],
-      tierColor[2],
-      tierColor[3],
-    );
+    tiers.push({
+      cx: tierCx,
+      top: tierTop,
+      bottom: currentBottom,
+      halfWidth: tierWidth * 0.5,
+      color: tierColor,
+    });
 
     topMost = Math.min(topMost, tierTop);
     currentBottom = tierTop + Math.max(1, Math.round(tierHeight * 0.35));
   }
 
-  const canopyCenterY = (topMost + trunkBottom - Math.round(size * 0.2)) * 0.5;
+  // Stop the trunk at the canopy base so no trunk pixels leak through
+  // narrow triangle apexes between or above tiers.
+  const trunkTop = canopyBaseY;
+  drawTaperedTrunk(
+    canvas,
+    cx,
+    trunkBottom,
+    trunkTop,
+    Math.max(1.5, size * 0.1),
+    1,
+    trunk,
+    rng.nextInt(1, 2),
+  );
+
+  // Draw canopy tiers over the trunk.
+  for (const tier of tiers) {
+    fillTriangle(
+      canvas,
+      tier.cx,
+      tier.top,
+      tier.cx - tier.halfWidth,
+      tier.bottom,
+      tier.cx + tier.halfWidth,
+      tier.bottom,
+      tier.color[0],
+      tier.color[1],
+      tier.color[2],
+      tier.color[3],
+    );
+  }
+
+  const canopyCenterY = (topMost + canopyBaseY) * 0.5;
   const canopyRadius = Math.max(maxWidth * 0.9, (trunkBottom - topMost) * 0.75);
   finishTree(canvas, rng, cx, canopyCenterY, canopyRadius);
 }
