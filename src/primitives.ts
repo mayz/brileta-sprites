@@ -287,6 +287,45 @@ export function darkenRim(
 // ----------------------------------------------------------------
 
 /**
+ * Check whether removing the opaque pixel at (row, col) would disconnect
+ * its opaque neighbors.  Examines the 8-neighbor ring (N, NE, E, SE, S,
+ * SW, W, NW) and counts 4-connected components among the opaque entries.
+ * If there are two or more components, the center pixel is a bridge and
+ * erasing it would split the sprite.
+ */
+function wouldDisconnect(
+  data: Uint8ClampedArray,
+  w: number,
+  h: number,
+  row: number,
+  col: number,
+): boolean {
+  // Sample the 8 neighbors clockwise: N, NE, E, SE, S, SW, W, NW.
+  const opaque: boolean[] = [
+    row > 0                      && data[((row - 1) * w + col    ) * 4 + 3] > 128,
+    row > 0     && col < w - 1   && data[((row - 1) * w + col + 1) * 4 + 3] > 128,
+    col < w - 1                  && data[( row      * w + col + 1) * 4 + 3] > 128,
+    row < h - 1 && col < w - 1   && data[((row + 1) * w + col + 1) * 4 + 3] > 128,
+    row < h - 1                  && data[((row + 1) * w + col    ) * 4 + 3] > 128,
+    row < h - 1 && col > 0       && data[((row + 1) * w + col - 1) * 4 + 3] > 128,
+    col > 0                      && data[( row      * w + col - 1) * 4 + 3] > 128,
+    row > 0     && col > 0       && data[((row - 1) * w + col - 1) * 4 + 3] > 128,
+  ];
+
+  // Count 4-connected components in the circular ring.  Each rising edge
+  // (transition from non-opaque to opaque going clockwise) starts a new
+  // component.
+  let components = 0;
+  for (let i = 0; i < 8; i++) {
+    if (opaque[i] && !opaque[(i + 7) % 8]) {
+      if (++components > 1) return true;
+    }
+  }
+
+  return false;
+}
+
+/**
  * Canopy nibbling: remove random rim pixels, then carve inward.
  * Phase 1: remove rim pixels with probability nibbleProb.
  * Phase 2: from each removed pixel, step toward center and clear
@@ -351,6 +390,7 @@ export function nibbleCanopy(
         continue;
       }
       if (rng.nextFloat() < np) {
+        if (wouldDisconnect(data, w, h, row, col)) continue;
         data[(row * w + col) * 4 + 3] = 0;
         rim[row * w + col] = 2;  // Mark for interior pass.
         anyNibbled = true;
@@ -384,7 +424,7 @@ export function nibbleCanopy(
           while (iLeft > 0 && data[(innerY * w + iLeft - 1) * 4 + 3] > 128) iLeft--;
           let iRight = innerX;
           while (iRight < w - 1 && data[(innerY * w + iRight + 1) * 4 + 3] > 128) iRight++;
-          if (iRight - iLeft + 1 > 3) {
+          if (iRight - iLeft + 1 > 3 && !wouldDisconnect(data, w, h, innerY, innerX)) {
             data[(innerY * w + innerX) * 4 + 3] = 0;
           }
         }

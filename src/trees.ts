@@ -442,6 +442,10 @@ function generateDeciduous(canvas: Canvas, size: number, rng: Rng): void {
     const sx = canopyCx + ux * startDist;
     const sy = canopyCy + uy * startDist;
     const extensionLength = rng.nextRange(2.0, 3.2);
+
+    // Skip extensions that would reach into the trunk zone.
+    if (sy + uy * extensionLength > trunkTop) continue;
+
     drawSegment(
       canvas,
       sx,
