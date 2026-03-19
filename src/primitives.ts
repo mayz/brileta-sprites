@@ -68,7 +68,7 @@ function compositeOver(
  * Compute rim mask: pixels with alpha > 128 that have a cardinal neighbor
  * at alpha == 0 (or canvas border).
  */
-function computeRimMask(canvas: Canvas): Uint8Array {
+export function computeRimMask(canvas: Canvas): Uint8Array {
   const { width: w, height: h, data } = canvas;
   const rim = new Uint8Array(h * w);
 
@@ -282,6 +282,57 @@ export function darkenRim(
   }
 }
 
+/**
+ * For each masked pixel, compute the horizontal opaque span width.
+ * Useful as a nibble guard to protect thin structural features.
+ */
+export function computeSpanWidths(canvas: Canvas, mask: Uint8Array): Uint8Array {
+  const { width: w, height: h, data } = canvas;
+  const spans = new Uint8Array(h * w);
+  for (let row = 0; row < h; row++) {
+    for (let col = 0; col < w; col++) {
+      if (!mask[row * w + col]) continue;
+      let left = col;
+      while (left > 0 && data[(row * w + left - 1) * 4 + 3] > 128) left--;
+      let right = col;
+      while (right < w - 1 && data[(row * w + right + 1) * 4 + 3] > 128) right++;
+      spans[row * w + col] = Math.min(255, right - left + 1);
+    }
+  }
+  return spans;
+}
+
+/**
+ * Shift sprite content down so the last opaque row sits at the canvas bottom.
+ * Useful for ground-anchored sprites (boulders, stumps, etc.).
+ */
+export function shiftToBottom(canvas: Canvas): void {
+  const { width: w, height: h, data } = canvas;
+  let lastOpaqueRow = -1;
+
+  for (let row = h - 1; row >= 0; row--) {
+    for (let col = 0; col < w; col++) {
+      if (data[(row * w + col) * 4 + 3] > 128) {
+        lastOpaqueRow = row;
+        break;
+      }
+    }
+    if (lastOpaqueRow >= 0) break;
+  }
+
+  if (lastOpaqueRow < 0) return;
+
+  const gap = h - 1 - lastOpaqueRow;
+  if (gap <= 0) return;
+
+  for (let row = h - 1; row >= gap; row--) {
+    const srcStart = (row - gap) * w * 4;
+    const dstStart = row * w * 4;
+    data.copyWithin(dstStart, srcStart, srcStart + w * 4);
+  }
+  data.fill(0, 0, gap * w * 4);
+}
+
 // ----------------------------------------------------------------
 // Nibbling
 // ----------------------------------------------------------------
@@ -293,7 +344,7 @@ export function darkenRim(
  * If there are two or more components, the center pixel is a bridge and
  * erasing it would split the sprite.
  */
-function wouldDisconnect(
+export function wouldDisconnect(
   data: Uint8ClampedArray,
   w: number,
   h: number,
@@ -325,154 +376,37 @@ function wouldDisconnect(
   return false;
 }
 
-/**
- * Canopy nibbling: remove random rim pixels, then carve inward.
- * Phase 1: remove rim pixels with probability nibbleProb.
- * Phase 2: from each removed pixel, step toward center and clear
- *          interior pixels with probability interiorProb.
- */
-export function nibbleCanopy(
-  canvas: Canvas,
-  rng: Rng,
-  cx: number,
-  cy: number,
-  radius: number,
-  nibbleProb: number,
-  interiorProb: number,
-): void {
-  const rim = computeRimMask(canvas);
-  const { width: w, height: h, data } = canvas;
-
-  // Restrict to canopy region (elliptical envelope).
-  const safeRadius = Math.max(radius, 1e-6);
-  let hasRim = false;
-
-  for (let row = 0; row < h; row++) {
-    for (let col = 0; col < w; col++) {
-      if (!rim[row * w + col]) continue;
-      const dx = (col - cx) / safeRadius;
-      const dy = (row - cy) / (safeRadius * 0.9);
-      if (dx * dx + dy * dy > 1.6) {
-        rim[row * w + col] = 0;
-      } else {
-        hasRim = true;
-      }
-    }
-  }
-
-  if (!hasRim) return;
-
-  const np = clamp(nibbleProb, 0, 1);
-  const ip = clamp(interiorProb, 0, 1);
-
-  // Precompute horizontal opaque span for each rim pixel so we can
-  // protect thin structures (trunks, branches) from nibbling.
-  const spanAtRim = new Uint8Array(h * w);
-  for (let row = 0; row < h; row++) {
-    for (let col = 0; col < w; col++) {
-      if (!rim[row * w + col]) continue;
-      let left = col;
-      while (left > 0 && data[(row * w + left - 1) * 4 + 3] > 128) left--;
-      let right = col;
-      while (right < w - 1 && data[(row * w + right + 1) * 4 + 3] > 128) right++;
-      spanAtRim[row * w + col] = Math.min(255, right - left + 1);
-    }
-  }
-
-  // Phase 1: erase random rim pixels.
-  // Skip pixels in narrow spans (≤ 3px) to avoid severing trunks.
-  let anyNibbled = false;
-  for (let row = 0; row < h; row++) {
-    for (let col = 0; col < w; col++) {
-      if (!rim[row * w + col]) continue;
-      if (spanAtRim[row * w + col] <= 3) {
-        rng.nextFloat();  // Consume RNG to keep determinism.
-        continue;
-      }
-      if (rng.nextFloat() < np) {
-        if (wouldDisconnect(data, w, h, row, col)) continue;
-        data[(row * w + col) * 4 + 3] = 0;
-        rim[row * w + col] = 2;  // Mark for interior pass.
-        anyNibbled = true;
-      }
-    }
-  }
-
-  // Phase 2: from nibbled pixels, step toward center and clear interior.
-  // Also protect thin spans from interior carving.
-  if (anyNibbled && ip > 0) {
-    for (let row = 0; row < h; row++) {
-      for (let col = 0; col < w; col++) {
-        if (rim[row * w + col] !== 2) continue;
-        if (rng.nextFloat() >= ip) continue;
-
-        // Step toward center.
-        let stepX = 0, stepY = 0;
-        const fdx = cx - col;
-        const fdy = cy - row;
-        if (fdx > 0) stepX = 1;
-        else if (fdx < 0) stepX = -1;
-        if (fdy > 0) stepY = 1;
-        else if (fdy < 0) stepY = -1;
-
-        const innerX = clamp(col + stepX, 0, w - 1);
-        const innerY = clamp(row + stepY, 0, h - 1);
-
-        // Check span at the target pixel before carving.
-        if (data[(innerY * w + innerX) * 4 + 3] > 128) {
-          let iLeft = innerX;
-          while (iLeft > 0 && data[(innerY * w + iLeft - 1) * 4 + 3] > 128) iLeft--;
-          let iRight = innerX;
-          while (iRight < w - 1 && data[(innerY * w + iRight + 1) * 4 + 3] > 128) iRight++;
-          if (iRight - iLeft + 1 > 3 && !wouldDisconnect(data, w, h, innerY, innerX)) {
-            data[(innerY * w + innerX) * 4 + 3] = 0;
-          }
-        }
-      }
-    }
-  }
+export interface NibbleOpts {
+  /** Called when the coin flip succeeds. Return true to allow erasure. */
+  guard?: (row: number, col: number) => boolean;
+  /** Called after a pixel is erased. */
+  onErase?: (row: number, col: number) => void;
 }
 
 /**
- * Boulder nibbling: remove random edge pixels from the upper half only.
- * Bottom edge stays solid (ground contact).
+ * Erase rim pixels where mask is set, with the given probability.
+ * Consumes one RNG call per masked pixel (preserving determinism
+ * regardless of guard outcome).
  */
-export function nibbleBoulder(
+export function nibbleRim(
   canvas: Canvas,
   rng: Rng,
   nibbleProb: number,
+  mask: Uint8Array,
+  opts?: NibbleOpts,
 ): void {
-  const rim = computeRimMask(canvas);
   const { width: w, height: h, data } = canvas;
-
-  // Find opaque region vertical extent.
-  let firstOpaqueRow = h, lastOpaqueRow = -1;
-  for (let row = 0; row < h; row++) {
-    for (let col = 0; col < w; col++) {
-      if (data[(row * w + col) * 4 + 3] > 0) {
-        if (row < firstOpaqueRow) firstOpaqueRow = row;
-        if (row > lastOpaqueRow) lastOpaqueRow = row;
-      }
-    }
-  }
-
-  if (firstOpaqueRow > lastOpaqueRow) return;
-  const midpoint = (firstOpaqueRow + lastOpaqueRow) >> 1;
-
-  // Only nibble upper half: zero out rim below midpoint.
-  for (let row = midpoint; row < h; row++) {
-    for (let col = 0; col < w; col++) {
-      rim[row * w + col] = 0;
-    }
-  }
-
   const np = clamp(nibbleProb, 0, 1);
+  const guard = opts?.guard;
+  const onErase = opts?.onErase;
 
   for (let row = 0; row < h; row++) {
     for (let col = 0; col < w; col++) {
-      if (!rim[row * w + col]) continue;
+      if (!mask[row * w + col]) continue;
       if (rng.nextFloat() < np) {
+        if (guard && !guard(row, col)) continue;
         data[(row * w + col) * 4 + 3] = 0;
+        onErase?.(row, col);
       }
     }
   }

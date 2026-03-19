@@ -1,12 +1,24 @@
 import {
+  asRgba,
+  distributeLobes,
+  jitterColor,
+  lightenRgba,
+  pick,
+  sampleUniqueIndices,
+  shiftColor,
+  type Point,
+} from './compose.js';
+import {
   batchStampEllipses,
   clamp,
-  clampChannel,
+  computeRimMask,
+  computeSpanWidths,
   darkenRim,
   drawLine,
   fillTriangle,
-  nibbleCanopy,
+  nibbleRim,
   stampEllipse,
+  wouldDisconnect,
   type EllipseSpec,
 } from './primitives.js';
 import { Rng } from './rng.js';
@@ -18,8 +30,6 @@ export enum TreeArchetype {
   DEAD = 'dead',
   SAPLING = 'sapling',
 }
-
-type Point = { x: number; y: number };
 
 interface TreeResult {
   canvas: Canvas;
@@ -63,45 +73,6 @@ const DEAD_BASES: Color[] = [
 
 const MOSS_RGBA: RGBA = [50, 70, 40, 180];
 
-
-function pick<T>(rng: Rng, items: readonly T[]): T {
-  return items[rng.nextInt(0, items.length - 1)];
-}
-
-function jitterColor(
-  rng: Rng,
-  base: Color,
-  delta: number,
-  min: Color = [0, 0, 0],
-  max: Color = [255, 255, 255],
-): Color {
-  return [
-    clamp(base[0] + rng.nextInt(-delta, delta), min[0], max[0]),
-    clamp(base[1] + rng.nextInt(-delta, delta), min[1], max[1]),
-    clamp(base[2] + rng.nextInt(-delta, delta), min[2], max[2]),
-  ];
-}
-
-function shiftColor(base: Color, dr: number, dg: number, db: number): Color {
-  return [
-    clampChannel(base[0] + dr),
-    clampChannel(base[1] + dg),
-    clampChannel(base[2] + db),
-  ];
-}
-
-function asRgba(color: Color, alpha: number): RGBA {
-  return [color[0], color[1], color[2], alpha];
-}
-
-function lightenRgba(rgba: RGBA, amount: number): RGBA {
-  return [
-    clampChannel(rgba[0] + amount),
-    clampChannel(rgba[1] + amount),
-    clampChannel(rgba[2] + amount),
-    rgba[3],
-  ];
-}
 
 function drawSegment(
   canvas: Canvas,
@@ -176,17 +147,6 @@ function drawTaperedTrunk(
   }
 }
 
-function sampleUniqueIndices(rng: Rng, length: number, count: number): number[] {
-  if (length <= 0 || count <= 0) return [];
-  const capped = Math.min(length, count);
-  const indices = Array.from({ length }, (_, i) => i);
-  for (let i = 0; i < capped; i++) {
-    const j = rng.nextInt(i, length - 1);
-    [indices[i], indices[j]] = [indices[j], indices[i]];
-  }
-  return indices.slice(0, capped);
-}
-
 function archetypeFromSeed(seed: number): TreeArchetype {
   const h = (Math.trunc(seed) >>> 0);
   const bucket = h % 20;
@@ -200,6 +160,95 @@ function resolveCanvasSize(rng: Rng, archetype: TreeArchetype, baseSize: number)
     ? baseSize - rng.nextInt(2, 5)
     : baseSize + rng.nextInt(-3, 3);
   return clamp(size, 10, 26);
+}
+
+/**
+ * Canopy nibbling: remove random rim pixels, then carve inward.
+ * Phase 1: remove rim pixels with probability nibbleProb.
+ * Phase 2: from each removed pixel, step toward center and clear
+ *          interior pixels with probability interiorProb.
+ */
+function nibbleCanopy(
+  canvas: Canvas,
+  rng: Rng,
+  cx: number,
+  cy: number,
+  radius: number,
+  nibbleProb: number,
+  interiorProb: number,
+): void {
+  const rim = computeRimMask(canvas);
+  const { width: w, height: h, data } = canvas;
+
+  // Restrict to canopy region (elliptical envelope).
+  const safeRadius = Math.max(radius, 1e-6);
+  let hasRim = false;
+
+  for (let row = 0; row < h; row++) {
+    for (let col = 0; col < w; col++) {
+      if (!rim[row * w + col]) continue;
+      const dx = (col - cx) / safeRadius;
+      const dy = (row - cy) / (safeRadius * 0.9);
+      if (dx * dx + dy * dy > 1.6) {
+        rim[row * w + col] = 0;
+      } else {
+        hasRim = true;
+      }
+    }
+  }
+
+  if (!hasRim) return;
+
+  const ip = clamp(interiorProb, 0, 1);
+
+  const spanAtRim = computeSpanWidths(canvas, rim);
+
+  // Phase 1: erase random rim pixels.
+  // Guard skips narrow spans (≤ 3px) and bridge pixels.
+  let anyNibbled = false;
+  nibbleRim(canvas, rng, nibbleProb, rim, {
+    guard: (row, col) =>
+      spanAtRim[row * w + col] > 3 &&
+      !wouldDisconnect(data, w, h, row, col),
+    onErase: (row, col) => {
+      rim[row * w + col] = 2;
+      anyNibbled = true;
+    },
+  });
+
+  // Phase 2: from nibbled pixels, step toward center and clear interior.
+  // Also protect thin spans from interior carving.
+  if (anyNibbled && ip > 0) {
+    for (let row = 0; row < h; row++) {
+      for (let col = 0; col < w; col++) {
+        if (rim[row * w + col] !== 2) continue;
+        if (rng.nextFloat() >= ip) continue;
+
+        // Step toward center.
+        let stepX = 0, stepY = 0;
+        const fdx = cx - col;
+        const fdy = cy - row;
+        if (fdx > 0) stepX = 1;
+        else if (fdx < 0) stepX = -1;
+        if (fdy > 0) stepY = 1;
+        else if (fdy < 0) stepY = -1;
+
+        const innerX = clamp(col + stepX, 0, w - 1);
+        const innerY = clamp(row + stepY, 0, h - 1);
+
+        // Check span at the target pixel before carving.
+        if (data[(innerY * w + innerX) * 4 + 3] > 128) {
+          let iLeft = innerX;
+          while (iLeft > 0 && data[(innerY * w + iLeft - 1) * 4 + 3] > 128) iLeft--;
+          let iRight = innerX;
+          while (iRight < w - 1 && data[(innerY * w + iRight + 1) * 4 + 3] > 128) iRight++;
+          if (iRight - iLeft + 1 > 3 && !wouldDisconnect(data, w, h, innerY, innerX)) {
+            data[(innerY * w + innerX) * 4 + 3] = 0;
+          }
+        }
+      }
+    }
+  }
 }
 
 function finishTree(
@@ -252,6 +301,47 @@ function branch(
 
   branch(ctx, x2, y2, angle - leftSpread, childLength, childThickness, depth - 1, lighter);
   branch(ctx, x2, y2, angle + rightSpread, childLength, childThickness, depth - 1, lighter);
+}
+
+interface ToneConfig {
+  countRange: [number, number];
+  radiusRange: [number, number];  // as fraction of baseRadius
+  xJitter: [number, number];      // as fraction of size
+  yJitter: [number, number];      // as fraction of size
+}
+
+function buildCanopyEllipses(
+  rng: Rng,
+  lobes: Point[],
+  baseRadius: number,
+  size: number,
+  tones: { shadow: ToneConfig; mid: ToneConfig; highlight: ToneConfig },
+  crownRxScale = 1,
+  crownRyScale = 1,
+): { shadows: EllipseSpec[]; mids: EllipseSpec[]; highlights: EllipseSpec[] } {
+  const shadows: EllipseSpec[] = [];
+  const mids: EllipseSpec[] = [];
+  const highlights: EllipseSpec[] = [];
+
+  for (const lobe of lobes) {
+    for (const [arr, cfg] of [
+      [shadows, tones.shadow],
+      [mids, tones.mid],
+      [highlights, tones.highlight],
+    ] as [EllipseSpec[], ToneConfig][]) {
+      for (let i = 0, n = rng.nextInt(cfg.countRange[0], cfg.countRange[1]); i < n; i++) {
+        const radius = baseRadius * rng.nextRange(cfg.radiusRange[0], cfg.radiusRange[1]);
+        arr.push({
+          cx: lobe.x + rng.nextRange(size * cfg.xJitter[0], size * cfg.xJitter[1]),
+          cy: lobe.y + rng.nextRange(size * cfg.yJitter[0], size * cfg.yJitter[1]),
+          rx: radius * crownRxScale,
+          ry: radius * crownRyScale,
+        });
+      }
+    }
+  }
+
+  return { shadows, mids, highlights };
 }
 
 function generateDeciduous(canvas: Canvas, size: number, rng: Rng): void {
@@ -320,25 +410,9 @@ function generateDeciduous(canvas: Canvas, size: number, rng: Rng): void {
   canopyCy = Math.max(canopyCy, minCanopyCy);
 
   const nLobes = rng.nextInt(3, 6);
-  const baseAngleStep = (Math.PI * 2) / nLobes;
-  const lobeAngleOffset = rng.nextRange(-Math.PI, Math.PI);
-  const lobeCenters: Point[] = [];
-
-  for (let i = 0; i < nLobes; i++) {
-    const angle = lobeAngleOffset + baseAngleStep * i + rng.nextRange(-0.4, 0.4);
-    const dist = baseRadius * rng.nextRange(0.45, 0.65);
-    const sinAngle = Math.sin(angle);
-    const verticalScale = sinAngle > 0 ? 0.9 : 0.7;
-    lobeCenters.push({
-      x: canopyCx + Math.cos(angle) * dist,
-      y: canopyCy + sinAngle * dist * verticalScale,
-    });
-  }
+  const lobeCenters = distributeLobes(rng, canopyCx, canopyCy, nLobes, baseRadius, [0.45, 0.65]);
 
   const centralFills: EllipseSpec[] = [];
-  const shadows: EllipseSpec[] = [];
-  const mids: EllipseSpec[] = [];
-  const highlights: EllipseSpec[] = [];
 
   for (let i = 0, n = rng.nextInt(1, 3); i < n; i++) {
     const radius = baseRadius * rng.nextRange(0.55, 0.7);
@@ -350,35 +424,16 @@ function generateDeciduous(canvas: Canvas, size: number, rng: Rng): void {
     });
   }
 
-  for (const lobe of lobeCenters) {
-    for (let i = 0, n = rng.nextInt(1, 3); i < n; i++) {
-      const radius = baseRadius * rng.nextRange(0.62, 0.76);
-      shadows.push({
-        cx: lobe.x + rng.nextRange(-size * 0.05, size * 0.05),
-        cy: lobe.y + rng.nextRange(-size * 0.07, size * 0.04),
-        rx: radius * crownRxScale,
-        ry: radius * crownRyScale,
-      });
-    }
-    for (let i = 0, n = rng.nextInt(1, 3); i < n; i++) {
-      const radius = baseRadius * rng.nextRange(0.58, 0.72);
-      mids.push({
-        cx: lobe.x + rng.nextRange(-size * 0.04, size * 0.04),
-        cy: lobe.y + rng.nextRange(-size * 0.05, size * 0.03),
-        rx: radius * crownRxScale,
-        ry: radius * crownRyScale,
-      });
-    }
-    for (let i = 0, n = rng.nextInt(1, 3); i < n; i++) {
-      const radius = baseRadius * rng.nextRange(0.45, 0.6);
-      highlights.push({
-        cx: lobe.x + rng.nextRange(-size * 0.03, size * 0.03),
-        cy: lobe.y - size * 0.05 + rng.nextRange(-size * 0.03, size * 0.02),
-        rx: radius * crownRxScale,
-        ry: radius * crownRyScale,
-      });
-    }
-  }
+  const { shadows, mids, highlights } = buildCanopyEllipses(
+    rng, lobeCenters, baseRadius, size,
+    {
+      shadow:    { countRange: [1, 3], radiusRange: [0.62, 0.76], xJitter: [-0.05, 0.05], yJitter: [-0.07, 0.04] },
+      mid:       { countRange: [1, 3], radiusRange: [0.58, 0.72], xJitter: [-0.04, 0.04], yJitter: [-0.05, 0.03] },
+      highlight: { countRange: [1, 3], radiusRange: [0.45, 0.6],  xJitter: [-0.03, 0.03], yJitter: [-0.08, -0.03] },
+    },
+    crownRxScale,
+    crownRyScale,
+  );
 
   for (const tipIndex of sampleUniqueIndices(rng, tips.length, rng.nextInt(1, 3))) {
     const tip = tips[tipIndex];
@@ -619,20 +674,7 @@ function generateSapling(canvas: Canvas, size: number, rng: Rng): void {
   const canopyCy = trunkTop - size * 0.08;
   const baseRadius = size * rng.nextRange(0.16, 0.22);
   const lobeCount = rng.nextInt(2, 4);
-  const baseAngleStep = (Math.PI * 2) / lobeCount;
-  const lobeAngleOffset = rng.nextRange(-Math.PI, Math.PI);
-  const lobeCenters: Point[] = [];
-
-  for (let i = 0; i < lobeCount; i++) {
-    const angle = lobeAngleOffset + baseAngleStep * i + rng.nextRange(-0.4, 0.4);
-    const dist = baseRadius * rng.nextRange(0.4, 0.6);
-    const sinAngle = Math.sin(angle);
-    const verticalScale = sinAngle > 0 ? 0.9 : 0.7;
-    lobeCenters.push({
-      x: canopyCx + Math.cos(angle) * dist,
-      y: canopyCy + sinAngle * dist * verticalScale,
-    });
-  }
+  const lobeCenters = distributeLobes(rng, canopyCx, canopyCy, lobeCount, baseRadius, [0.4, 0.6]);
 
   const centralFills: EllipseSpec[] = [{
     cx: canopyCx,
@@ -640,39 +682,15 @@ function generateSapling(canvas: Canvas, size: number, rng: Rng): void {
     rx: baseRadius * rng.nextRange(0.45, 0.55),
     ry: baseRadius * rng.nextRange(0.45, 0.55),
   }];
-  const shadows: EllipseSpec[] = [];
-  const mids: EllipseSpec[] = [];
-  const highlights: EllipseSpec[] = [];
 
-  for (const lobe of lobeCenters) {
-    for (let i = 0, n = rng.nextInt(1, 2); i < n; i++) {
-      const radius = baseRadius * rng.nextRange(0.5, 0.68);
-      shadows.push({
-        cx: lobe.x + rng.nextRange(-size * 0.05, size * 0.05),
-        cy: lobe.y + rng.nextRange(-size * 0.06, size * 0.04),
-        rx: radius,
-        ry: radius,
-      });
-    }
-    for (let i = 0, n = rng.nextInt(1, 2); i < n; i++) {
-      const radius = baseRadius * rng.nextRange(0.44, 0.6);
-      mids.push({
-        cx: lobe.x + rng.nextRange(-size * 0.04, size * 0.04),
-        cy: lobe.y + rng.nextRange(-size * 0.05, size * 0.03),
-        rx: radius,
-        ry: radius,
-      });
-    }
-    for (let i = 0, n = rng.nextInt(1, 2); i < n; i++) {
-      const radius = baseRadius * rng.nextRange(0.32, 0.48);
-      highlights.push({
-        cx: lobe.x + rng.nextRange(-size * 0.03, size * 0.03),
-        cy: lobe.y - size * 0.05 + rng.nextRange(-size * 0.03, size * 0.02),
-        rx: radius,
-        ry: radius,
-      });
-    }
-  }
+  const { shadows, mids, highlights } = buildCanopyEllipses(
+    rng, lobeCenters, baseRadius, size,
+    {
+      shadow:    { countRange: [1, 2], radiusRange: [0.5, 0.68],  xJitter: [-0.05, 0.05], yJitter: [-0.06, 0.04] },
+      mid:       { countRange: [1, 2], radiusRange: [0.44, 0.6],  xJitter: [-0.04, 0.04], yJitter: [-0.05, 0.03] },
+      highlight: { countRange: [1, 2], radiusRange: [0.32, 0.48], xJitter: [-0.03, 0.03], yJitter: [-0.08, -0.03] },
+    },
+  );
 
   batchStampEllipses(canvas, centralFills, shadow[0], shadow[1], shadow[2], shadow[3], 1.4, 0.5);
   batchStampEllipses(canvas, shadows, shadow[0], shadow[1], shadow[2], shadow[3], 1.5, 0.5);

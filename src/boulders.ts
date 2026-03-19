@@ -1,11 +1,12 @@
 /** Procedural boulder sprite generation. */
+import { shiftColor, stampThreeTone } from './compose.js';
 import {
-  batchStampEllipses,
   clamp,
-  clampChannel,
+  computeRimMask,
   darkenRim,
   drawLine,
-  nibbleBoulder,
+  nibbleRim,
+  shiftToBottom,
   stampEllipse,
   type EllipseSpec,
 } from './primitives.js';
@@ -56,26 +57,17 @@ const BOULDER_BASE_PALETTES: Color[] = [
 
 function pickStoneColors(rng: Rng): Palette3 {
   const base = BOULDER_BASE_PALETTES[rng.nextInt(0, BOULDER_BASE_PALETTES.length - 1)];
-  const baseRgb = [base[0], base[1], base[2]];
 
   const brightnessOffset = rng.nextInt(-18, 18);
   const tempOffset = rng.nextInt(-8, 8);
 
-  baseRgb[0] = clamp(baseRgb[0] + brightnessOffset - tempOffset, 70, 190);
-  baseRgb[1] = clamp(baseRgb[1] + brightnessOffset, 70, 190);
-  baseRgb[2] = clamp(baseRgb[2] + brightnessOffset + tempOffset, 70, 195);
-
-  const shadow: Color = [
-    clampChannel(baseRgb[0] - 36),
-    clampChannel(baseRgb[1] - 36),
-    clampChannel(baseRgb[2] - 34),
+  const body: Color = [
+    clamp(base[0] + brightnessOffset - tempOffset, 70, 190),
+    clamp(base[1] + brightnessOffset, 70, 190),
+    clamp(base[2] + brightnessOffset + tempOffset, 70, 195),
   ];
-  const body: Color = [baseRgb[0], baseRgb[1], baseRgb[2]];
-  const highlight: Color = [
-    clampChannel(baseRgb[0] + 36),
-    clampChannel(baseRgb[1] + 36),
-    clampChannel(baseRgb[2] + 38),
-  ];
+  const shadow = shiftColor(body, -36, -36, -34);
+  const highlight = shiftColor(body, 36, 36, 38);
 
   return [shadow, body, highlight];
 }
@@ -102,9 +94,7 @@ function addSurfaceCracks(
 ): void {
   if (rng.nextFloat() > 0.60) return;
 
-  const crackR = clampChannel(shadowRgb[0] - 20);
-  const crackG = clampChannel(shadowRgb[1] - 20);
-  const crackB = clampChannel(shadowRgb[2] - 18);
+  const crack = shiftColor(shadowRgb, -20, -20, -18);
   const crackA = 190;
 
   const nCracks = rng.nextInt(1, 3);
@@ -123,7 +113,7 @@ function addSurfaceCracks(
       canvas,
       Math.round(sx), Math.round(sy),
       Math.round(ex), Math.round(ey),
-      crackR, crackG, crackB, crackA, 1,
+      crack[0], crack[1], crack[2], crackA, 1,
     );
   }
 }
@@ -169,28 +159,88 @@ function addSurfaceDetail(
 }
 
 // ----------------------------------------------------------------
-// Three-tone stone layer stamping
+// Nibbling
 // ----------------------------------------------------------------
 
-function stampStoneLayers(
+/** Remove random edge pixels from the upper half only. Bottom stays solid (ground contact). */
+function nibbleBoulder(canvas: Canvas, rng: Rng, nibbleProb: number): void {
+  const rim = computeRimMask(canvas);
+  const { width: w, height: h, data } = canvas;
+
+  let firstOpaqueRow = h, lastOpaqueRow = -1;
+  for (let row = 0; row < h; row++) {
+    for (let col = 0; col < w; col++) {
+      if (data[(row * w + col) * 4 + 3] > 0) {
+        if (row < firstOpaqueRow) firstOpaqueRow = row;
+        if (row > lastOpaqueRow) lastOpaqueRow = row;
+      }
+    }
+  }
+
+  if (firstOpaqueRow > lastOpaqueRow) return;
+  const midpoint = (firstOpaqueRow + lastOpaqueRow) >> 1;
+
+  for (let row = midpoint; row < h; row++) {
+    for (let col = 0; col < w; col++) {
+      rim[row * w + col] = 0;
+    }
+  }
+
+  nibbleRim(canvas, rng, nibbleProb, rim);
+}
+
+// ----------------------------------------------------------------
+// Shared lobe-to-layer derivation and finish sequence
+// ----------------------------------------------------------------
+
+interface LobeTriple {
+  body: EllipseSpec;
+  shadow: EllipseSpec;
+  highlight: EllipseSpec;
+}
+
+/** Derive body / shadow / highlight ellipses from a single lobe offset. */
+function deriveLobeLayers(
+  cx: number, cy: number,
+  ox: number, oy: number,
+  rx: number, ry: number,
+  size: number,
+): LobeTriple {
+  return {
+    body: { cx: cx + ox, cy: cy + oy, rx, ry },
+    shadow: {
+      cx: cx + ox * 0.75,
+      cy: cy + oy * 0.675 + size * 0.028,
+      rx: rx * 1.06,
+      ry: ry * 1.08,
+    },
+    highlight: {
+      cx: cx + ox * 0.36 - size * 0.028,
+      cy: cy + oy * 0.29 - size * 0.065,
+      rx: rx * 0.32,
+      ry: ry * 0.21,
+    },
+  };
+}
+
+/** Common finish sequence shared by every boulder archetype. */
+function finishBoulder(
   canvas: Canvas,
+  rng: Rng,
   pal: Palette3,
+  cx: number, cy: number,
+  baseRx: number, baseRy: number,
   shadowEllipses: EllipseSpec[],
   bodyEllipses: EllipseSpec[],
   highlightEllipses: EllipseSpec[],
-  falloff: [number, number, number] = [2.2, 2.0, 1.9],
-  hardness: [number, number, number] = [0.88, 0.86, 0.80],
+  nibbleProb: number,
+  falloff?: [number, number, number],
+  hardness?: [number, number, number],
 ): void {
-  const passes: [EllipseSpec[], number, number, number, number][] = [
-    [shadowEllipses, 0, 220, falloff[0], hardness[0]],
-    [bodyEllipses, 1, 250, falloff[1], hardness[1]],
-    [highlightEllipses, 2, 210, falloff[2], hardness[2]],
-  ];
-
-  for (const [ellipses, tone, alpha, fo, hard] of passes) {
-    const c = pal[tone];
-    batchStampEllipses(canvas, ellipses, c[0], c[1], c[2], alpha, fo, hard);
-  }
+  stampThreeTone(canvas, pal, shadowEllipses, bodyEllipses, highlightEllipses, falloff, hardness);
+  addSurfaceDetail(canvas, rng, cx, cy, baseRx, baseRy, pal[0]);
+  nibbleBoulder(canvas, rng, nibbleProb);
+  darkenRim(canvas, 18, 18, 15);
 }
 
 // ----------------------------------------------------------------
@@ -240,21 +290,13 @@ function generateRounded(canvas: Canvas, size: number, rng: Rng): void {
     const rx = baseRx * rng.nextRange(0.70, 1.0);
     const ry = baseRy * rng.nextRange(0.48, 0.68);
 
-    bodyEllipses.push({ cx: cx + ox, cy: cy + oy, rx, ry });
-    shadowEllipses.push({
-      cx: cx + ox * 0.76, cy: cy + oy * 0.68 + size * 0.03,
-      rx: rx * 1.06, ry: ry * 1.08,
-    });
-    highlightEllipses.push({
-      cx: cx + ox * 0.36 - size * 0.03, cy: cy + oy * 0.30 - size * 0.07,
-      rx: rx * 0.30, ry: ry * 0.20,
-    });
+    const lobe = deriveLobeLayers(cx, cy, ox, oy, rx, ry, size);
+    bodyEllipses.push(lobe.body);
+    shadowEllipses.push(lobe.shadow);
+    highlightEllipses.push(lobe.highlight);
   }
 
-  stampStoneLayers(canvas, pal, shadowEllipses, bodyEllipses, highlightEllipses);
-  addSurfaceDetail(canvas, rng, cx, cy, baseRx, baseRy, pal[0]);
-  nibbleBoulder(canvas, rng, 0.10);
-  darkenRim(canvas, 18, 18, 15);
+  finishBoulder(canvas, rng, pal, cx, cy, baseRx, baseRy, shadowEllipses, bodyEllipses, highlightEllipses, 0.10);
 }
 
 function generateTall(canvas: Canvas, size: number, rng: Rng): void {
@@ -303,21 +345,13 @@ function generateTall(canvas: Canvas, size: number, rng: Rng): void {
     const rx = baseRx * rng.nextRange(0.62, 0.90);
     const ry = baseRy * rng.nextRange(0.42, 0.62);
 
-    bodyEllipses.push({ cx: cx + ox, cy: cy + oy, rx, ry });
-    shadowEllipses.push({
-      cx: cx + ox * 0.72, cy: cy + oy * 0.68 + size * 0.03,
-      rx: rx * 1.06, ry: ry * 1.06,
-    });
-    highlightEllipses.push({
-      cx: cx + ox * 0.34 - size * 0.02, cy: cy + oy * 0.28 - size * 0.08,
-      rx: rx * 0.32, ry: ry * 0.20,
-    });
+    const lobe = deriveLobeLayers(cx, cy, ox, oy, rx, ry, size);
+    bodyEllipses.push(lobe.body);
+    shadowEllipses.push(lobe.shadow);
+    highlightEllipses.push(lobe.highlight);
   }
 
-  stampStoneLayers(canvas, pal, shadowEllipses, bodyEllipses, highlightEllipses);
-  addSurfaceDetail(canvas, rng, cx, cy, baseRx, baseRy, pal[0]);
-  nibbleBoulder(canvas, rng, 0.10);
-  darkenRim(canvas, 18, 18, 15);
+  finishBoulder(canvas, rng, pal, cx, cy, baseRx, baseRy, shadowEllipses, bodyEllipses, highlightEllipses, 0.10);
 }
 
 function generateFlat(canvas: Canvas, size: number, rng: Rng): void {
@@ -363,21 +397,13 @@ function generateFlat(canvas: Canvas, size: number, rng: Rng): void {
     const rx = baseRx * rng.nextRange(0.65, 0.92);
     const ry = baseRy * rng.nextRange(0.44, 0.64);
 
-    bodyEllipses.push({ cx: cx + ox, cy: cy + oy, rx, ry });
-    shadowEllipses.push({
-      cx: cx + ox * 0.78, cy: cy + oy * 0.68 + size * 0.02,
-      rx: rx * 1.04, ry: ry * 1.08,
-    });
-    highlightEllipses.push({
-      cx: cx + ox * 0.38 - size * 0.03, cy: cy + oy * 0.28 - size * 0.04,
-      rx: rx * 0.34, ry: ry * 0.22,
-    });
+    const lobe = deriveLobeLayers(cx, cy, ox, oy, rx, ry, size);
+    bodyEllipses.push(lobe.body);
+    shadowEllipses.push(lobe.shadow);
+    highlightEllipses.push(lobe.highlight);
   }
 
-  stampStoneLayers(canvas, pal, shadowEllipses, bodyEllipses, highlightEllipses);
-  addSurfaceDetail(canvas, rng, cx, cy, baseRx, baseRy, pal[0]);
-  nibbleBoulder(canvas, rng, 0.08);
-  darkenRim(canvas, 18, 18, 15);
+  finishBoulder(canvas, rng, pal, cx, cy, baseRx, baseRy, shadowEllipses, bodyEllipses, highlightEllipses, 0.08);
 }
 
 function generateBlocky(canvas: Canvas, size: number, rng: Rng): void {
@@ -420,59 +446,17 @@ function generateBlocky(canvas: Canvas, size: number, rng: Rng): void {
     const rx = baseRx * rng.nextRange(0.68, 1.02);
     const ry = baseRy * rng.nextRange(0.48, 0.70);
 
-    bodyEllipses.push({ cx: cx + ox, cy: cy + oy, rx, ry });
-    shadowEllipses.push({
-      cx: cx + ox * 0.74, cy: cy + oy * 0.66 + size * 0.03,
-      rx: rx * 1.08, ry: ry * 1.10,
-    });
-    highlightEllipses.push({
-      cx: cx + ox * 0.36 - size * 0.03, cy: cy + oy * 0.30 - size * 0.07,
-      rx: rx * 0.32, ry: ry * 0.22,
-    });
+    const lobe = deriveLobeLayers(cx, cy, ox, oy, rx, ry, size);
+    bodyEllipses.push(lobe.body);
+    shadowEllipses.push(lobe.shadow);
+    highlightEllipses.push(lobe.highlight);
   }
 
-  stampStoneLayers(
-    canvas, pal, shadowEllipses, bodyEllipses, highlightEllipses,
-    [2.4, 2.2, 2.0],
-    [0.92, 0.90, 0.84],
+  finishBoulder(
+    canvas, rng, pal, cx, cy, baseRx, baseRy,
+    shadowEllipses, bodyEllipses, highlightEllipses,
+    0.14, [2.4, 2.2, 2.0], [0.92, 0.90, 0.84],
   );
-  addSurfaceDetail(canvas, rng, cx, cy, baseRx, baseRy, pal[0]);
-  nibbleBoulder(canvas, rng, 0.14);
-  darkenRim(canvas, 18, 18, 15);
-}
-
-// ----------------------------------------------------------------
-// Vertical repositioning
-// ----------------------------------------------------------------
-
-/** Shift content down so the last opaque row (alpha > 128) sits at canvas bottom. */
-function shiftToBottom(canvas: Canvas, size: number): void {
-  const { width: w, data } = canvas;
-  let lastOpaqueRow = -1;
-
-  for (let row = size - 1; row >= 0; row--) {
-    for (let col = 0; col < w; col++) {
-      if (data[(row * w + col) * 4 + 3] > 128) {
-        lastOpaqueRow = row;
-        break;
-      }
-    }
-    if (lastOpaqueRow >= 0) break;
-  }
-
-  if (lastOpaqueRow < 0) return;
-
-  const gap = size - 1 - lastOpaqueRow;
-  if (gap <= 0) return;
-
-  // Shift rows down by gap. Work bottom-up to avoid overwriting.
-  for (let row = size - 1; row >= gap; row--) {
-    const srcStart = (row - gap) * w * 4;
-    const dstStart = row * w * 4;
-    data.copyWithin(dstStart, srcStart, srcStart + w * 4);
-  }
-  // Clear the top rows.
-  data.fill(0, 0, gap * w * 4);
 }
 
 // ----------------------------------------------------------------
@@ -499,7 +483,7 @@ export function generateBoulder(
     generateBlocky(canvas, actualSize, rng);
   }
 
-  shiftToBottom(canvas, actualSize);
+  shiftToBottom(canvas);
 
   return { canvas, archetype };
 }
